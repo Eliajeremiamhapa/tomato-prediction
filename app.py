@@ -161,7 +161,7 @@ def predict():
         return jsonify({
             'status': 'success',
             'prediction': result_class,
-            'clean_prediction': result_class.replace('Tomato___', '').replace(/_/g, ' '),
+            'clean_prediction': result_class.replace('Tomato___', '').replace('_', ' '),
             'confidence': f"{confidence_score:.2f}%",
             'confidence_raw': round(confidence_score, 2),
             'severity_stage': severity_stage,
