@@ -1,4 +1,5 @@
 import os
+import threading
 import numpy as np
 import onnxruntime as ort
 import requests
@@ -10,39 +11,42 @@ from apscheduler.schedulers.background import BackgroundScheduler
 app = Flask(__name__)
 CORS(app)
 
-# --- BACK4APP PARSE DATABASE CONFIGURATION ---
-PARSE_APP_ID = os.environ.get("PARSE_APP_ID", "Fwk5RhYZcVXho4Te49jOrwpkPa5KopFcpgEuWgS4")
-PARSE_CLIENT_KEY = os.environ.get("PARSE_CLIENT_KEY", "FTNByPOFkvid0a6jid0lFjeVP1dfiKjoouFse9JU")
+# --- BACK4APP PARSE DATABASE CONFIGURATION (100% INTEGRATED) ---
+PARSE_APP_ID = "Fwk5RhYZcVXho4Te49jOrwpkPa5KopFcpgEuWgS4"
+PARSE_REST_KEY = "FTNByPOFkvid0a6jid0lFjeVP1dfiKjoouFse9JU"
 PARSE_URL = "https://parseapi.back4app.com/classes/Prediction"
 
-def save_to_back4app_db(disease_name, confidence, severity_stage, farmer_advice):
-    """Utility function to log prediction diagnostic results into Back4App Database."""
+def _async_post_to_back4app(payload):
+    """Background task to push database logs without blocking image uploads."""
     headers = {
         "X-Parse-Application-Id": PARSE_APP_ID,
-        "X-Parse-REST-API-Key": PARSE_CLIENT_KEY,
+        "X-Parse-REST-API-Key": PARSE_REST_KEY,
+        "X-Parse-Client-Key": PARSE_REST_KEY,
         "Content-Type": "application/json"
     }
+    try:
+        response = requests.post(PARSE_URL, json=payload, headers=headers, timeout=8)
+        if response.status_code in [200, 201]:
+            print("[Back4App DB Log] Record saved successfully in Prediction class.")
+        else:
+            print(f"[Back4App DB Warning] HTTP Status {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"[Back4App DB Error] Failed to reach Parse Database: {str(e)}")
+
+def save_to_back4app_db(disease_name, confidence, severity_stage, farmer_advice):
+    """Triggers asynchronous non-blocking thread for database writes."""
     payload = {
         "disease_name": disease_name,
         "confidence": confidence,
         "severity_stage": severity_stage,
         "farmer_advice": farmer_advice
     }
-    try:
-        response = requests.post(PARSE_URL, json=payload, headers=headers, timeout=5)
-        if response.status_code == 201:
-            print("[Back4App DB Log] Record created successfully inside Prediction class.")
-        else:
-            print(f"[Back4App DB Warning] Database write returned status: {response.status_code}")
-    except Exception as e:
-        print(f"[Back4App DB Error] Failed to persist prediction record: {str(e)}")
+    threading.Thread(target=_async_post_to_back4app, args=(payload,)).start()
 
 # 1. RENDER / BACK4APP CLOUD COMPATIBLE PATH LOGIC
-# Moves from static Windows paths to production relative environment layout
 MODEL_FILENAME = "tomato_disease_model.onnx"
 MODEL_PATH = os.path.join(os.path.dirname(__file__), MODEL_FILENAME)
 
-# Validation layer ensuring your weights array is present inside the container filesystem
 if os.path.exists(MODEL_PATH):
     print(f"Initializing Production Engine: Loading ONNX model structure from {MODEL_PATH}...")
     session = ort.InferenceSession(MODEL_PATH)
@@ -52,14 +56,11 @@ else:
         session = ort.InferenceSession(MODEL_FILENAME)
     else:
         raise FileNotFoundError(
-            f"Critical Deployment Error: '{MODEL_FILENAME}' was not found inside the root package context. "
-            "Please ensure you upload your ONNX model to the same folder as app.py."
+            f"Critical Deployment Error: '{MODEL_FILENAME}' was not found inside the root package context."
         )
 
-# Extract expected graph input structural key name automatically
 input_name = session.get_inputs()[0].name
 
-# Official 6-class structural disease mapping target matrix array
 class_names = [
     'Target_Spot', 
     'Tomato___Early_blight', 
@@ -118,7 +119,6 @@ def keep_server_awake():
     except Exception as e:
         print(f"[Keep-Awake Warning] System loop heartbeat skip: {str(e)}")
 
-# Initialize background scheduler task loop
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=keep_server_awake, trigger="interval", minutes=10)
 scheduler.start()
@@ -141,24 +141,22 @@ def predict():
         if file.filename == '':
             return jsonify({'error': 'No physical image asset selected for diagnostic pipeline processing'}), 400
 
-        # 2. Structural Image Preprocessing
+        # Structural Image Preprocessing
         img = Image.open(file).convert('RGB')
         img = img.resize((224, 224))
         
-        # Min-Max Normalization Scale Conversion to Float32: [0, 255] -> [0.0, 1.0]
         img_array = np.array(img).astype(np.float32) / 255.0
-        img_array = np.expand_dims(img_array, axis=0) # Add batch dimension vector tracking layer
+        img_array = np.expand_dims(img_array, axis=0)
 
-        # 3. ONNX Inference Engine Parsing Pipeline Execution
+        # ONNX Inference Engine Parsing Pipeline Execution
         outputs = session.run(None, {input_name: img_array})
         predictions = outputs[0][0]  
         
-        # Isolate index position showcasing maximum statistical strength
         max_idx = np.argmax(predictions)
         result_class = class_names[max_idx]
         confidence_score = float(predictions[max_idx]) * 100
 
-        # 4. METHOD 1: DYNAMIC SEVERITY STAGE LOGIC
+        # Dynamic Severity Stage Logic
         if result_class == 'healthy':
             severity_stage = "Safe"
         else:
@@ -172,13 +170,12 @@ def predict():
                 severity_stage = "Critical Stage"
                 lookup_stage = "Critical"
 
-        # 5. FETCH AUTOMATED FARMER ADVICE
+        # Fetch Automated Farmer Advice
         if result_class == 'healthy':
             farmer_advice = ADVICE_DATABASE['healthy']['Safe']
         else:
             farmer_advice = ADVICE_DATABASE[result_class][lookup_stage]
 
-        # Construct vector breakdown output for visual tracking bars
         breakdown = {}
         for idx, name in enumerate(class_names):
             breakdown[name] = round(float(predictions[idx]) * 100, 2)
@@ -186,7 +183,7 @@ def predict():
         clean_disease_name = result_class.replace('Tomato___', '').replace('_', ' ')
         formatted_confidence = f"{confidence_score:.2f}%"
 
-        # 6. SAVE PREDICTION LOG DIRECTLY TO BACK4APP DATABASE
+        # SAVE TO BACK4APP PARSE DATABASE (ASYNC)
         save_to_back4app_db(
             disease_name=clean_disease_name,
             confidence=formatted_confidence,
@@ -194,7 +191,6 @@ def predict():
             farmer_advice=farmer_advice
         )
 
-        # 7. MOBILE APP READY UNIFIED JSON PAYLOAD OUTPUT
         return jsonify({
             'status': 'success',
             'prediction': result_class,
