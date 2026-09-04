@@ -10,7 +10,34 @@ from apscheduler.schedulers.background import BackgroundScheduler
 app = Flask(__name__)
 CORS(app)
 
-# 1. RENDER CLOUD COMPATIBLE PATH LOGIC
+# --- BACK4APP PARSE DATABASE CONFIGURATION ---
+PARSE_APP_ID = os.environ.get("PARSE_APP_ID", "Fwk5RhYZcVXho4Te49jOrwpkPa5KopFcpgEuWgS4")
+PARSE_CLIENT_KEY = os.environ.get("PARSE_CLIENT_KEY", "FTNByPOFkvid0a6jid0lFjeVP1dfiKjoouFse9JU")
+PARSE_URL = "https://parseapi.back4app.com/classes/Prediction"
+
+def save_to_back4app_db(disease_name, confidence, severity_stage, farmer_advice):
+    """Utility function to log prediction diagnostic results into Back4App Database."""
+    headers = {
+        "X-Parse-Application-Id": PARSE_APP_ID,
+        "X-Parse-REST-API-Key": PARSE_CLIENT_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "disease_name": disease_name,
+        "confidence": confidence,
+        "severity_stage": severity_stage,
+        "farmer_advice": farmer_advice
+    }
+    try:
+        response = requests.post(PARSE_URL, json=payload, headers=headers, timeout=5)
+        if response.status_code == 201:
+            print("[Back4App DB Log] Record created successfully inside Prediction class.")
+        else:
+            print(f"[Back4App DB Warning] Database write returned status: {response.status_code}")
+    except Exception as e:
+        print(f"[Back4App DB Error] Failed to persist prediction record: {str(e)}")
+
+# 1. RENDER / BACK4APP CLOUD COMPATIBLE PATH LOGIC
 # Moves from static Windows paths to production relative environment layout
 MODEL_FILENAME = "tomato_disease_model.onnx"
 MODEL_PATH = os.path.join(os.path.dirname(__file__), MODEL_FILENAME)
@@ -26,7 +53,7 @@ else:
     else:
         raise FileNotFoundError(
             f"Critical Deployment Error: '{MODEL_FILENAME}' was not found inside the root package context. "
-            "Please ensure you upload your ONNX model to the same folder as app.py on Render."
+            "Please ensure you upload your ONNX model to the same folder as app.py."
         )
 
 # Extract expected graph input structural key name automatically
@@ -74,21 +101,20 @@ ADVICE_DATABASE = {
     }
 }
 
-# --- RENDER KEEP-AWAKE SELF PING ALGORITHM ---
+# --- KEEP-AWAKE SELF PING ALGORITHM ---
 def keep_server_awake():
     """Background task to query local deployment route preventing spin down."""
     try:
-        # Render provides RENDER_EXTERNAL_URL natively in environment setups
-        self_url = os.environ.get('RENDER_EXTERNAL_URL')
+        self_url = os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('CONTAINER_URL')
         if self_url:
             ping_target = f"{self_url.rstrip('/')}/ping"
             print(f"[Keep-Awake] Pinging external routing gateway: {ping_target}")
             response = requests.get(ping_target, timeout=10)
             print(f"[Keep-Awake] Heartbeat acknowledged. Status Code: {response.status_code}")
         else:
-            # Fallback local container route targeting default port configuration
-            print("[Keep-Awake] RENDER_EXTERNAL_URL not found yet. Pinging local internal loop...")
-            requests.get("http://127.0.0.1:10000/ping", timeout=5)
+            print("[Keep-Awake] External URL context not set. Pinging local internal loop...")
+            port = int(os.environ.get("PORT", 8080))
+            requests.get(f"http://127.0.0.1:{port}/ping", timeout=5)
     except Exception as e:
         print(f"[Keep-Awake Warning] System loop heartbeat skip: {str(e)}")
 
@@ -157,12 +183,23 @@ def predict():
         for idx, name in enumerate(class_names):
             breakdown[name] = round(float(predictions[idx]) * 100, 2)
 
-        # 6. MOBILE APP READY UNIFIED JSON PAYLOAD OUTPUT
+        clean_disease_name = result_class.replace('Tomato___', '').replace('_', ' ')
+        formatted_confidence = f"{confidence_score:.2f}%"
+
+        # 6. SAVE PREDICTION LOG DIRECTLY TO BACK4APP DATABASE
+        save_to_back4app_db(
+            disease_name=clean_disease_name,
+            confidence=formatted_confidence,
+            severity_stage=severity_stage,
+            farmer_advice=farmer_advice
+        )
+
+        # 7. MOBILE APP READY UNIFIED JSON PAYLOAD OUTPUT
         return jsonify({
             'status': 'success',
             'prediction': result_class,
-            'clean_prediction': result_class.replace('Tomato___', '').replace('_', ' '),
-            'confidence': f"{confidence_score:.2f}%",
+            'clean_prediction': clean_disease_name,
+            'confidence': formatted_confidence,
             'confidence_raw': round(confidence_score, 2),
             'severity_stage': severity_stage,
             'farmer_advice': farmer_advice,
@@ -173,7 +210,6 @@ def predict():
         return jsonify({'error': f"Inference Failure Tracking: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    # Render specifies alternative deployment port environments using env variables
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 8080))
     print(f"AI Tomato Mobile Gateway processing actively inside host engine port: {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
