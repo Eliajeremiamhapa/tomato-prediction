@@ -11,13 +11,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 app = Flask(__name__)
 CORS(app)
 
-# --- BACK4APP PARSE DATABASE CONFIGURATION (100% INTEGRATED) ---
+# --- BACK4APP PARSE DATABASE CONFIGURATION ---
 PARSE_APP_ID = "Fwk5RhYZcVXho4Te49jOrwpkPa5KopFcpgEuWgS4"
 PARSE_REST_KEY = "FTNByPOFkvid0a6jid0lFjeVP1dfiKjoouFse9JU"
 PARSE_URL = "https://parseapi.back4app.com/classes/Prediction"
 
 def _async_post_to_back4app(payload):
-    """Background task to push database logs without blocking image uploads."""
+    """Background thread function to safely log predictions without failing the API."""
     headers = {
         "X-Parse-Application-Id": PARSE_APP_ID,
         "X-Parse-REST-API-Key": PARSE_REST_KEY,
@@ -25,16 +25,16 @@ def _async_post_to_back4app(payload):
         "Content-Type": "application/json"
     }
     try:
-        response = requests.post(PARSE_URL, json=payload, headers=headers, timeout=8)
+        response = requests.post(PARSE_URL, json=payload, headers=headers, timeout=5)
         if response.status_code in [200, 201]:
-            print("[Back4App DB Log] Record saved successfully in Prediction class.")
+            print("[Back4App DB Log] Record created successfully inside Prediction class.")
         else:
-            print(f"[Back4App DB Warning] HTTP Status {response.status_code}: {response.text}")
+            print(f"[Back4App DB Warning] DB write failed with code {response.status_code}: {response.text}")
     except Exception as e:
-        print(f"[Back4App DB Error] Failed to reach Parse Database: {str(e)}")
+        print(f"[Back4App DB Error] Connection error during DB post: {str(e)}")
 
 def save_to_back4app_db(disease_name, confidence, severity_stage, farmer_advice):
-    """Triggers asynchronous non-blocking thread for database writes."""
+    """Triggers non-blocking background task."""
     payload = {
         "disease_name": disease_name,
         "confidence": confidence,
@@ -43,7 +43,7 @@ def save_to_back4app_db(disease_name, confidence, severity_stage, farmer_advice)
     }
     threading.Thread(target=_async_post_to_back4app, args=(payload,)).start()
 
-# 1. RENDER / BACK4APP CLOUD COMPATIBLE PATH LOGIC
+# 1. MODEL LOADING & PATHS
 MODEL_FILENAME = "tomato_disease_model.onnx"
 MODEL_PATH = os.path.join(os.path.dirname(__file__), MODEL_FILENAME)
 
@@ -102,22 +102,18 @@ ADVICE_DATABASE = {
     }
 }
 
-# --- KEEP-AWAKE SELF PING ALGORITHM ---
+# --- KEEP-AWAKE SCHEDULER ---
 def keep_server_awake():
-    """Background task to query local deployment route preventing spin down."""
     try:
         self_url = os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('CONTAINER_URL')
         if self_url:
             ping_target = f"{self_url.rstrip('/')}/ping"
-            print(f"[Keep-Awake] Pinging external routing gateway: {ping_target}")
-            response = requests.get(ping_target, timeout=10)
-            print(f"[Keep-Awake] Heartbeat acknowledged. Status Code: {response.status_code}")
+            requests.get(ping_target, timeout=10)
         else:
-            print("[Keep-Awake] External URL context not set. Pinging local internal loop...")
             port = int(os.environ.get("PORT", 8080))
             requests.get(f"http://127.0.0.1:{port}/ping", timeout=5)
     except Exception as e:
-        print(f"[Keep-Awake Warning] System loop heartbeat skip: {str(e)}")
+        print(f"[Keep-Awake Warning] Heartbeat skip: {str(e)}")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=keep_server_awake, trigger="interval", minutes=10)
@@ -141,14 +137,13 @@ def predict():
         if file.filename == '':
             return jsonify({'error': 'No physical image asset selected for diagnostic pipeline processing'}), 400
 
-        # Structural Image Preprocessing
+        # 1. Image Preprocessing
         img = Image.open(file).convert('RGB')
         img = img.resize((224, 224))
-        
         img_array = np.array(img).astype(np.float32) / 255.0
         img_array = np.expand_dims(img_array, axis=0)
 
-        # ONNX Inference Engine Parsing Pipeline Execution
+        # 2. ONNX Inference
         outputs = session.run(None, {input_name: img_array})
         predictions = outputs[0][0]  
         
@@ -156,9 +151,10 @@ def predict():
         result_class = class_names[max_idx]
         confidence_score = float(predictions[max_idx]) * 100
 
-        # Dynamic Severity Stage Logic
+        # 3. Dynamic Severity Logic
         if result_class == 'healthy':
             severity_stage = "Safe"
+            farmer_advice = ADVICE_DATABASE['healthy']['Safe']
         else:
             if confidence_score < 70.0:
                 severity_stage = "Early Stage"
@@ -169,28 +165,29 @@ def predict():
             else:
                 severity_stage = "Critical Stage"
                 lookup_stage = "Critical"
-
-        # Fetch Automated Farmer Advice
-        if result_class == 'healthy':
-            farmer_advice = ADVICE_DATABASE['healthy']['Safe']
-        else:
+            
             farmer_advice = ADVICE_DATABASE[result_class][lookup_stage]
 
         breakdown = {}
         for idx, name in enumerate(class_names):
             breakdown[name] = round(float(predictions[idx]) * 100, 2)
 
+        # 4. PREPARE FORMATTED STRINGS BEFORE DB CALL
         clean_disease_name = result_class.replace('Tomato___', '').replace('_', ' ')
         formatted_confidence = f"{confidence_score:.2f}%"
 
-        # SAVE TO BACK4APP PARSE DATABASE (ASYNC)
-        save_to_back4app_db(
-            disease_name=clean_disease_name,
-            confidence=formatted_confidence,
-            severity_stage=severity_stage,
-            farmer_advice=farmer_advice
-        )
+        # 5. ASYNCHRONOUS DATABASE SAVE (Does not block or crash the UI)
+        try:
+            save_to_back4app_db(
+                disease_name=clean_disease_name,
+                confidence=formatted_confidence,
+                severity_stage=severity_stage,
+                farmer_advice=farmer_advice
+            )
+        except Exception as db_err:
+            print(f"[DB Log Error] Non-fatal DB trigger error: {db_err}")
 
+        # 6. RETURN SUCCESSFUL RESPONSE TO FRONTEND
         return jsonify({
             'status': 'success',
             'prediction': result_class,
@@ -203,9 +200,9 @@ def predict():
         })
 
     except Exception as e:
+        print(f"[Server Exception]: {str(e)}")
         return jsonify({'error': f"Inference Failure Tracking: {str(e)}"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
-    print(f"AI Tomato Mobile Gateway processing actively inside host engine port: {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
